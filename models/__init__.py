@@ -3,7 +3,7 @@ from .attention import AttentionGate, ChannelAttention
 from .kan_modules import (
     KANLinear, KANLayer, KANBlock,
     FastKANConvLayer, PatchEmbed,
-    KConvLayer, ConvLayer, D_ConvLayer,
+    ConvLayer, D_ConvLayer,
 )
 
 __all__ = [
@@ -11,5 +11,5 @@ __all__ = [
     "AttentionGate", "ChannelAttention",
     "KANLinear", "KANLayer", "KANBlock",
     "FastKANConvLayer", "PatchEmbed",
-    "KConvLayer", "ConvLayer", "D_ConvLayer",
+    "ConvLayer", "D_ConvLayer",
 ]
