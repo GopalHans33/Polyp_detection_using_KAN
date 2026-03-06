@@ -1,368 +1,273 @@
 """
-dataset.py  —  KA-ResUNet++
+metrics.py  —  KA-ResUNet++
 =============================
-Kvasir-SEG dataset, split, and dataloaders.
+All evaluation metrics: Dice, IoU, Precision, Recall, Specificity, HD95.
 
-FIXES IN THIS VERSION:
-  [FIX 1] build_dataloaders now returns exactly 3 values (train, val, test).
-           Previously returned 5 (train, val, test, None, None) which caused:
-           ValueError: too many values to unpack (expected 3) in main.py.
+BUG FIXED:
+  _to_binary_np was unconditionally calling torch.sigmoid(pred) on every input.
+  train.py was passing binary {0, 1} tensors (already thresholded) into this function.
+  sigmoid(0) = 0.5, sigmoid(1) = 0.731 — both above threshold 0.3 → EVERY pixel = positive.
+  This caused Dice to freeze at the dataset's base polyp coverage rate (0.2440) every epoch.
 
-  [FIX 2] ImageCompression: auto-detects albumentations API version.
-           Old albumentations: quality_range=(10, 40)
-           New albumentations: quality_lower=10, quality_upper=40
-           Code now works with either version installed in Colab.
-
-  [FIX 3] CoarseDropout: auto-detects albumentations API version.
-           Old albumentations: max_holes, max_height, max_width, min_holes, fill_value
-           New albumentations: num_holes_range, hole_height_range, hole_width_range
-           Code now works with either version installed in Colab.
-
-  [FIX 4] ElasticTransform: alpha_affine argument removed (deprecated >= 1.4).
-  [FIX 5] OpticalDistortion: shift_limit argument removed (deprecated >= 1.4).
+  FIX: _to_binary_np no longer applies sigmoid. It expects inputs that are already
+  probabilities in [0, 1]. train.py must pass probs (not pre-binarized preds).
 """
 
-import os
-import cv2
+import time
 import numpy as np
-import warnings
-from glob import glob
-from typing import List, Tuple, Optional
-
 import torch
-from torch.utils.data import Dataset, DataLoader
-import albumentations as A
-from albumentations.pytorch import ToTensorV2
-from sklearn.model_selection import train_test_split
+import torch.nn.functional as F
+
+try:
+    from medpy.metric.binary import hd95 as medpy_hd95
+    MEDPY_AVAILABLE = True
+except ImportError:
+    MEDPY_AVAILABLE = False
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Albumentations version-safe helpers
+#  AverageMeter
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _make_image_compression():
+class AverageMeter:
+    """Computes and stores the average and current value."""
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.val   = 0
+        self.avg   = 0
+        self.sum   = 0
+        self.count = 0
+
+    def update(self, val, n=1):
+        self.val    = val
+        self.sum   += val * n
+        self.count += n
+        self.avg    = self.sum / self.count
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Core conversion helper
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _to_binary_np(pred, target, threshold=0.5):
     """
-    Returns ImageCompression transform that works with any albumentations version.
-    Old: quality_range=(10, 40)
-    New: quality_lower=10, quality_upper=40
+    Convert pred and target to binary numpy uint8 arrays.
+
+    IMPORTANT — CONTRACT FOR pred:
+        pred must be a PROBABILITY tensor/array with values in [0, 1].
+        Do NOT pass raw logits here. Apply sigmoid BEFORE calling any metric.
+        Do NOT pass pre-binarized {0, 1} tensors here either — pass raw probs.
+
+    WHY the old code was broken:
+        The old version called torch.sigmoid(pred) unconditionally.
+        train.py was passing preds = (probs > threshold).float() → values {0.0, 1.0}
+        sigmoid(0.0) = 0.5, sigmoid(1.0) = 0.731
+        With threshold=0.3: both 0.5 and 0.731 are > 0.3 → ALL pixels = positive
+        → Dice = 2 * base_coverage / (1 + base_coverage) = 0.2440, frozen forever.
     """
+    # Convert pred to numpy — NO sigmoid here, caller is responsible
+    if torch.is_tensor(pred):
+        pred_np = pred.detach().cpu().float().numpy()
+    else:
+        pred_np = np.array(pred, dtype=np.float32)
+
+    # Convert target to numpy
+    if torch.is_tensor(target):
+        target_np = target.detach().cpu().float().numpy()
+    else:
+        target_np = np.array(target, dtype=np.float32)
+
+    pred_bin   = (pred_np   > threshold).astype(np.uint8).flatten()
+    target_bin = (target_np > 0.5      ).astype(np.uint8).flatten()
+
+    return pred_bin, target_bin
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Core metric functions
+# ══════════════════════════════════════════════════════════════════════════════
+
+def dice_score(pred, target, threshold=0.5, smooth=1e-5):
+    """Dice / F1 score. pred must be probability in [0,1]."""
+    p, t = _to_binary_np(pred, target, threshold)
+    inter = (p & t).sum()
+    return float((2.0 * inter + smooth) / (p.sum() + t.sum() + smooth))
+
+
+def iou_score(pred, target, threshold=0.5, smooth=1e-5):
+    """Jaccard / IoU score. pred must be probability in [0,1]."""
+    p, t = _to_binary_np(pred, target, threshold)
+    inter = (p & t).sum()
+    union = (p | t).sum()
+    return float((inter + smooth) / (union + smooth))
+
+
+def precision_score(pred, target, threshold=0.5, smooth=1e-5):
+    """Precision = TP / (TP + FP). pred must be probability in [0,1]."""
+    p, t = _to_binary_np(pred, target, threshold)
+    tp = (p & t).sum()
+    fp = (p.astype(bool) & ~t.astype(bool)).sum()
+    return float((tp + smooth) / (tp + fp + smooth))
+
+
+def recall_score(pred, target, threshold=0.5, smooth=1e-5):
+    """Recall = TP / (TP + FN). pred must be probability in [0,1]."""
+    p, t = _to_binary_np(pred, target, threshold)
+    tp = (p & t).sum()
+    fn = (~p.astype(bool) & t.astype(bool)).sum()
+    return float((tp + smooth) / (tp + fn + smooth))
+
+
+def specificity_score(pred, target, threshold=0.5, smooth=1e-5):
+    """Specificity = TN / (TN + FP). pred must be probability in [0,1]."""
+    p, t = _to_binary_np(pred, target, threshold)
+    tn = (~p.astype(bool) & ~t.astype(bool)).sum()
+    fp = ( p.astype(bool) & ~t.astype(bool)).sum()
+    return float((tn + smooth) / (tn + fp + smooth))
+
+
+def f1_score_metric(pred, target, threshold=0.5, smooth=1e-5):
+    """F1 Score (harmonic mean of precision and recall). pred must be in [0,1]."""
+    prec = precision_score(pred, target, threshold, smooth)
+    rec  = recall_score(pred,   target, threshold, smooth)
+    return float((2.0 * prec * rec + smooth) / (prec + rec + smooth))
+
+
+def hd95_score(pred, target, threshold=0.5):
+    """
+    95th percentile Hausdorff Distance.
+    Returns 0.0 if medpy missing or masks are empty.
+    pred must be probability in [0,1].
+    """
+    if not MEDPY_AVAILABLE:
+        return 0.0
+    p, t = _to_binary_np(pred, target, threshold)
+    if p.sum() == 0 or t.sum() == 0:
+        return 0.0
     try:
-        with warnings.catch_warnings():
-            warnings.filterwarnings("error")
-            t = A.ImageCompression(quality_lower=10, quality_upper=40, p=0.3)
-        return t
+        # Attempt to reshape to 2D for medpy
+        n = len(p)
+        side = int(n ** 0.5)
+        p2d = p.reshape(side, side)
+        t2d = t.reshape(side, side)
+        return float(medpy_hd95(p2d, t2d))
     except Exception:
-        return A.ImageCompression(quality_range=(10, 40), p=0.3)
+        return 0.0
 
 
-def _make_coarse_dropout():
+def fpr_on_negatives(pred, target, threshold=0.5):
+    """False Positive Rate on negative (polyp-free) samples."""
+    p, t = _to_binary_np(pred, target, threshold)
+    if t.sum() > 0:
+        return None
+    return float(p.sum()) / (len(p) + 1e-8)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  compute_all_metrics  —  expects pred to be probabilities in [0, 1]
+# ══════════════════════════════════════════════════════════════════════════════
+
+def compute_all_metrics(pred, target, threshold=0.5):
     """
-    Returns CoarseDropout transform that works with any albumentations version.
-    Old: max_holes, max_height, max_width, min_holes, fill_value
-    New: num_holes_range, hole_height_range, hole_width_range
+    Compute all metrics for a single image.
+
+    Args:
+        pred   : probability tensor or array in [0, 1] — NOT logits, NOT binary
+        target : ground truth binary mask
+        threshold: binarization threshold (default 0.5)
     """
-    try:
-        with warnings.catch_warnings():
-            warnings.filterwarnings("error")
-            t = A.CoarseDropout(
-                num_holes_range=(1, 8),
-                hole_height_range=(1, 32),
-                hole_width_range=(1, 32),
-                p=0.3
-            )
-        return t
-    except Exception:
-        return A.CoarseDropout(
-            max_holes=8, max_height=32, max_width=32,
-            min_holes=1, fill_value=0, p=0.3
-        )
+    return {
+        "dice":        dice_score(pred,        target, threshold),
+        "iou":         iou_score(pred,         target, threshold),
+        "precision":   precision_score(pred,   target, threshold),
+        "recall":      recall_score(pred,      target, threshold),
+        "specificity": specificity_score(pred, target, threshold),
+        "f1":          f1_score_metric(pred,   target, threshold),
+        "hd95":        hd95_score(pred,        target, threshold),
+        "fpr":         fpr_on_negatives(pred,  target, threshold),
+    }
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Augmentation Pipelines
+#  MetricsTracker
 # ══════════════════════════════════════════════════════════════════════════════
 
-def get_train_transform(img_size: int = 256) -> A.Compose:
-    """Full augmentation pipeline. Compatible with any albumentations version."""
-    return A.Compose([
-        A.Resize(img_size, img_size),
+class MetricsTracker:
+    """Tracks and averages metrics over an epoch."""
+    METRIC_NAMES = ["dice", "iou", "precision", "recall", "specificity", "f1", "hd95"]
 
-        # Geometric
-        A.HorizontalFlip(p=0.5),
-        A.VerticalFlip(p=0.2),
-        A.RandomRotate90(p=0.3),
-        A.ShiftScaleRotate(
-            shift_limit=0.1, scale_limit=0.1,
-            rotate_limit=15, p=0.5
-        ),
+    def __init__(self):
+        self.meters = {k: AverageMeter() for k in self.METRIC_NAMES}
+        self.fpr_values = []
 
-        # Elastic deformations — deprecated args removed
-        A.OneOf([
-            A.ElasticTransform(alpha=120, sigma=12, p=0.5),
-            A.GridDistortion(num_steps=5, distort_limit=0.3, p=0.5),
-            A.OpticalDistortion(distort_limit=0.2, p=0.5),
-        ], p=0.4),
+    def reset(self):
+        for m in self.meters.values():
+            m.reset()
+        self.fpr_values = []
 
-        # Blur / noise
-        A.OneOf([
-            A.MotionBlur(blur_limit=7, p=0.5),
-            A.GaussianBlur(blur_limit=5, p=0.5),
-            A.Defocus(radius=(1, 3), p=0.5),
-        ], p=0.3),
-        A.GaussNoise(p=0.3),
+    def update(self, metrics_dict: dict, n: int = 1):
+        for key in self.METRIC_NAMES:
+            if key in metrics_dict and metrics_dict[key] is not None:
+                self.meters[key].update(float(metrics_dict[key]), n)
+        if metrics_dict.get("fpr") is not None:
+            self.fpr_values.append(float(metrics_dict["fpr"]))
 
-        # FIX 2: version-safe ImageCompression
-        _make_image_compression(),
-
-        # Lighting
-        A.CLAHE(clip_limit=4.0, p=0.3),
-        A.RandomBrightnessContrast(brightness_limit=0.3, contrast_limit=0.3, p=0.4),
-        A.HueSaturationValue(
-            hue_shift_limit=15, sat_shift_limit=20, val_shift_limit=20, p=0.3),
-        A.RandomGamma(gamma_limit=(80, 120), p=0.2),
-
-        # FIX 3: version-safe CoarseDropout
-        _make_coarse_dropout(),
-
-        # Normalize with ImageNet stats
-        A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
-        ToTensorV2(),
-    ])
-
-
-def get_val_transform(img_size: int = 256) -> A.Compose:
-    """Validation/test transform — resize and normalize only."""
-    return A.Compose([
-        A.Resize(img_size, img_size),
-        A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
-        ToTensorV2(),
-    ])
+    def get_averages(self) -> dict:
+        result = {k: self.meters[k].avg for k in self.METRIC_NAMES}
+        if self.fpr_values:
+            result["fpr_negatives"] = float(np.mean(self.fpr_values))
+        return result
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Boundary Map
+#  Size-stratified evaluation
 # ══════════════════════════════════════════════════════════════════════════════
 
-def compute_boundary(mask: np.ndarray, kernel_size: int = 5) -> np.ndarray:
-    """dilate(mask) - erode(mask). Returns float32 boundary ring in [0,1]."""
-    kernel  = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
-    dilated = cv2.dilate(mask, kernel, iterations=1)
-    eroded  = cv2.erode(mask,  kernel, iterations=1)
-    return np.clip(dilated.astype(np.float32) - eroded.astype(np.float32), 0.0, 1.0)
+def compute_size_stratified_metrics(predictions, targets, threshold=0.5):
+    """Compute Dice stratified by polyp coverage size."""
+    bins = {"empty": [], "small": [], "medium": [], "large": [], "huge": []}
 
+    if torch.is_tensor(predictions):
+        predictions = predictions.cpu().detach()
+    if torch.is_tensor(targets):
+        targets = targets.cpu().detach()
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  KvasirDataset
-# ══════════════════════════════════════════════════════════════════════════════
+    for i in range(len(predictions)):
+        pred   = predictions[i]
+        target = targets[i]
+        t_np   = target.cpu().numpy() if torch.is_tensor(target) else np.array(target)
+        coverage = (t_np > 0.5).sum() / t_np.size
 
-class KvasirDataset(Dataset):
-    """
-    Kvasir-SEG dataset. Images and masks share the same filename.
-    Returns (image [3,H,W], seg_mask [1,H,W], boundary_mask [1,H,W]).
-    """
+        if   coverage == 0:       cat = "empty"
+        elif coverage <= 0.05:    cat = "small"
+        elif coverage <= 0.15:    cat = "medium"
+        elif coverage <= 0.30:    cat = "large"
+        else:                     cat = "huge"
 
-    def __init__(
-        self,
-        image_paths: List[str],
-        mask_paths:  List[str],
-        transform:   Optional[A.Compose] = None,
-        img_size:    int = 256,
-        boundary_kernel_size: int = 5,
-    ):
-        assert len(image_paths) == len(mask_paths), \
-            f"Mismatch: {len(image_paths)} images vs {len(mask_paths)} masks"
-        self.image_paths = image_paths
-        self.mask_paths  = mask_paths
-        self.transform   = transform
-        self.img_size    = img_size
-        self.bk_size     = boundary_kernel_size
+        bins[cat].append(dice_score(pred, target, threshold))
 
-    def __len__(self) -> int:
-        return len(self.image_paths)
-
-    def __getitem__(self, idx: int):
-        # Load
-        image = cv2.imread(self.image_paths[idx])
-        if image is None:
-            raise FileNotFoundError(f"Cannot read: {self.image_paths[idx]}")
-        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-
-        mask = cv2.imread(self.mask_paths[idx], cv2.IMREAD_GRAYSCALE)
-        if mask is None:
-            raise FileNotFoundError(f"Cannot read: {self.mask_paths[idx]}")
-
-        # Binarize before augmentation
-        seg_mask = (mask > 127).astype(np.float32)
-
-        if self.transform:
-            augmented = self.transform(
-                image=image,
-                mask=(seg_mask * 255).astype(np.uint8)
-            )
-            image   = augmented["image"]
-            seg_aug = augmented["mask"].float() / 255.0
-            seg_np  = seg_aug.numpy()
-            bnd_np  = compute_boundary((seg_np > 0.5).astype(np.float32), self.bk_size)
-            seg_mask = seg_aug.unsqueeze(0)
-            bnd_mask = torch.from_numpy(bnd_np).unsqueeze(0)
-        else:
-            image    = cv2.resize(image, (self.img_size, self.img_size))
-            seg_mask = cv2.resize(seg_mask, (self.img_size, self.img_size),
-                                  interpolation=cv2.INTER_NEAREST)
-            bnd_np   = compute_boundary((seg_mask > 0.5).astype(np.float32), self.bk_size)
-            mean = np.array([0.485, 0.456, 0.406])
-            std  = np.array([0.229, 0.224, 0.225])
-            image    = (image.astype(np.float32) / 255.0 - mean) / std
-            image    = torch.from_numpy(image.transpose(2, 0, 1)).float()
-            seg_mask = torch.from_numpy(seg_mask).unsqueeze(0).float()
-            bnd_mask = torch.from_numpy(bnd_np).unsqueeze(0).float()
-
-        return image, seg_mask, bnd_mask
+    return {
+        cat: {"dice": float(np.mean(s)) if s else 0.0, "count": len(s)}
+        for cat, s in bins.items()
+    }
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Helpers
+#  InferenceTimer
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _scan_kvasir(img_dir: str, mask_dir: str) -> Tuple[List[str], List[str]]:
-    """Match images to masks by base filename."""
-    exts = ("jpg", "jpeg", "png", "JPG", "JPEG", "PNG")
+class InferenceTimer:
+    def __init__(self):
+        self.times = []
+        self._t = 0.0
 
-    img_paths = []
-    for ext in exts:
-        img_paths.extend(glob(os.path.join(img_dir, f"*.{ext}")))
-    img_paths = sorted(set(img_paths))
+    def start(self):
+        self._t = time.time()
 
-    mask_lookup = {}
-    for ext in exts:
-        for p in glob(os.path.join(mask_dir, f"*.{ext}")):
-            key = os.path.splitext(os.path.basename(p))[0]
-            mask_lookup[key] = p
+    def stop(self):
+        self.times.append(time.time() - self._t)
 
-    matched_imgs, matched_masks = [], []
-    missing = 0
-    for ip in img_paths:
-        key = os.path.splitext(os.path.basename(ip))[0]
-        if key in mask_lookup:
-            matched_imgs.append(ip)
-            matched_masks.append(mask_lookup[key])
-        else:
-            missing += 1
-
-    if missing > 0:
-        print(f"  [Warning] {missing} images had no matching mask — skipped.")
-
-    return matched_imgs, matched_masks
-
-
-def _get_coverage_strata(mask_paths: List[str]) -> List[str]:
-    """Assign polyp coverage category for stratified splitting."""
-    strata = []
-    for mp in mask_paths:
-        mask = cv2.imread(mp, cv2.IMREAD_GRAYSCALE)
-        if mask is None:
-            strata.append("small")
-            continue
-        c = (mask > 127).sum() / mask.size
-        if   c == 0:    strata.append("empty")
-        elif c <= 0.05: strata.append("small")
-        elif c <= 0.15: strata.append("medium")
-        elif c <= 0.30: strata.append("large")
-        else:           strata.append("huge")
-    return strata
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  build_dataloaders — returns exactly 3 loaders
-# ══════════════════════════════════════════════════════════════════════════════
-
-def build_dataloaders(cfg):
-    """
-    Build train / val / test DataLoaders from Kvasir-SEG.
-
-    Split (stratified by polyp size):
-        800 train  |  100 val  |  100 test
-
-    FIX: Returns exactly 3 values now — train_loader, val_loader, test_loader.
-    Previously returned 5 values (with two trailing Nones), which caused:
-        ValueError: too many values to unpack (expected 3)
-    in any main.py that does: train_loader, val_loader, test_loader = build_dataloaders(cfg)
-    """
-    print(f"\n[Dataset] {'─'*45}")
-    print(f"[Dataset] Scanning: {cfg.KVASIR_IMG_DIR}")
-
-    all_imgs, all_masks = _scan_kvasir(cfg.KVASIR_IMG_DIR, cfg.KVASIR_MASK_DIR)
-
-    if len(all_imgs) == 0:
-        raise RuntimeError(
-            f"\nNo images found in: {cfg.KVASIR_IMG_DIR}\n"
-            f"Check that cfg.KVASIR_IMG_DIR is set correctly in config.py."
-        )
-
-    print(f"[Dataset] Found {len(all_imgs)} valid image-mask pairs.")
-
-    strata = _get_coverage_strata(all_masks)
-
-    train_imgs, temp_imgs, train_masks, temp_masks = train_test_split(
-        all_imgs, all_masks,
-        test_size=(cfg.VAL_RATIO + cfg.TEST_RATIO),
-        random_state=cfg.SEED, stratify=strata,
-    )
-    strata_temp = _get_coverage_strata(temp_masks)
-    val_imgs, test_imgs, val_masks, test_masks = train_test_split(
-        temp_imgs, temp_masks,
-        test_size=0.5,
-        random_state=cfg.SEED, stratify=strata_temp,
-    )
-
-    print(f"[Dataset] Split: {len(train_imgs)} Train, {len(val_imgs)} Val, {len(test_imgs)} Test")
-
-    train_dataset = KvasirDataset(
-        train_imgs, train_masks,
-        get_train_transform(cfg.IMG_SIZE),
-        cfg.IMG_SIZE, cfg.BOUNDARY_KERNEL_SIZE,
-    )
-    val_dataset = KvasirDataset(
-        val_imgs, val_masks,
-        get_val_transform(cfg.IMG_SIZE),
-        cfg.IMG_SIZE, cfg.BOUNDARY_KERNEL_SIZE,
-    )
-    test_dataset = KvasirDataset(
-        test_imgs, test_masks,
-        get_val_transform(cfg.IMG_SIZE),
-        cfg.IMG_SIZE, cfg.BOUNDARY_KERNEL_SIZE,
-    )
-
-    print("[Dataset] Ready.")
-
-    train_loader = DataLoader(
-        train_dataset, batch_size=cfg.BATCH_SIZE,
-        shuffle=True,  num_workers=cfg.NUM_WORKERS,
-        pin_memory=cfg.PIN_MEMORY, drop_last=True,
-    )
-    val_loader = DataLoader(
-        val_dataset, batch_size=cfg.VAL_BATCH_SIZE,
-        shuffle=False, num_workers=cfg.NUM_WORKERS,
-        pin_memory=cfg.PIN_MEMORY,
-    )
-    test_loader = DataLoader(
-        test_dataset, batch_size=1,
-        shuffle=False, num_workers=cfg.NUM_WORKERS,
-    )
-
-    # FIX: return exactly 3 values — no trailing Nones
-    return train_loader, val_loader, test_loader
-
-
-def verify_batch(loader: DataLoader, name: str = "loader"):
-    """Sanity check — print shapes and value ranges of first batch."""
-    for imgs, seg_masks, bnd_masks in loader:
-        print(f"  [{name}]")
-        print(f"    image : {tuple(imgs.shape)}      — should be (B, 3, 256, 256)")
-        print(f"    seg   : {tuple(seg_masks.shape)} — should be (B, 1, 256, 256)")
-        print(f"    bnd   : {tuple(bnd_masks.shape)} — should be (B, 1, 256, 256)")
-        print(f"    img range  : [{imgs.min():.2f}, {imgs.max():.2f}]")
-        print(f"    seg values : {seg_masks.unique().tolist()}")
-        pct = (seg_masks > 0.5).float().mean().item() * 100
-        print(f"    polyp coverage: {pct:.1f}%")
-        break
+    def mean_ms(self):
+        return float(np.mean(self.times)) * 1000 if self.times else 0.0
