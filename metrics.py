@@ -1,16 +1,7 @@
 """
 metrics.py  —  KA-ResUNet++
 =============================
-All 9 evaluation metrics in one place.
-
-Sources:
-  iou_score, dice_coef, f1_score  → Code 2 (Cell 10, 14) with extensions
-  hd95                            → Code 2's medpy import, properly wrapped
-  precision, recall               → Code 1 (Cell 12)
-  specificity, fpr_negatives      → NEW (not in any source notebook)
-  inference_time                  → Code 1 (Cell 17) pattern
-
-AverageMeter taken exactly from Code 2 (Cell 10).
+All evaluation metrics: Dice, IoU, Precision, Recall, Specificity, HD95.
 """
 
 import time
@@ -18,16 +9,17 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+# Try importing medpy for HD95, but don't crash if missing
 try:
     from medpy.metric.binary import hd95 as medpy_hd95
     MEDPY_AVAILABLE = True
 except ImportError:
     MEDPY_AVAILABLE = False
-    print("[metrics.py] medpy not found — HD95 will return 0.0. Install: pip install medpy")
+    # No print here to keep logs clean during training
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  AverageMeter  (from Code 2, Cell 10 — exact copy)
+#  AverageMeter
 # ══════════════════════════════════════════════════════════════════════════════
 
 class AverageMeter:
@@ -49,7 +41,7 @@ class AverageMeter:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Core metric functions  (operate on numpy arrays)
+#  Core metric functions
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _to_binary_np(pred, target, threshold=0.5):
@@ -58,6 +50,7 @@ def _to_binary_np(pred, target, threshold=0.5):
         pred   = torch.sigmoid(pred).detach().cpu().numpy()
     if torch.is_tensor(target):
         target = target.detach().cpu().numpy()
+    
     pred_bin   = (pred   > threshold).astype(np.uint8)
     target_bin = (target > 0.5      ).astype(np.uint8)
     return pred_bin, target_bin
@@ -95,12 +88,7 @@ def recall_score(pred, target, threshold=0.5, smooth=1e-5):
 
 
 def specificity_score(pred, target, threshold=0.5, smooth=1e-5):
-    """
-    Specificity = TN / (TN + FP).
-    NEW — not in any source notebook.
-    Critical for clinical deployment: how often does the model
-    correctly identify polyp-FREE regions?
-    """
+    """Specificity = TN / (TN + FP)."""
     p, t = _to_binary_np(pred, target, threshold)
     tn = (~p.astype(bool) & ~t.astype(bool)).sum()
     fp = ( p.astype(bool) & ~t.astype(bool)).sum()
@@ -108,7 +96,7 @@ def specificity_score(pred, target, threshold=0.5, smooth=1e-5):
 
 
 def f1_score_metric(pred, target, threshold=0.5, smooth=1e-5):
-    """F1 = 2*precision*recall / (precision+recall). Same as Dice for binary."""
+    """F1 Score (same as Dice for binary)."""
     prec = precision_score(pred, target, threshold, smooth)
     rec  = recall_score(pred,   target, threshold, smooth)
     return (2.0 * prec * rec + smooth) / (prec + rec + smooth)
@@ -117,14 +105,17 @@ def f1_score_metric(pred, target, threshold=0.5, smooth=1e-5):
 def hd95_score(pred, target, threshold=0.5):
     """
     95th percentile Hausdorff Distance.
-    Measures boundary quality — MANDATORY for MICCAI/MedIA papers.
-    Returns 0.0 if medpy not available or masks are empty.
+    Returns 0.0 if medpy is missing or masks are empty.
     """
     if not MEDPY_AVAILABLE:
         return 0.0
+    
     p, t = _to_binary_np(pred, target, threshold)
+    
+    # HD95 requires both prediction and target to have some foreground
     if p.sum() == 0 or t.sum() == 0:
         return 0.0
+        
     try:
         return float(medpy_hd95(p, t))
     except Exception:
@@ -132,30 +123,23 @@ def hd95_score(pred, target, threshold=0.5):
 
 
 def fpr_on_negatives(pred, target, threshold=0.5):
-    """
-    False Positive Rate on negative (polyp-free) samples.
-    FPR = FP / (FP + TN)
-    NEW — your clinical contribution, not in any source notebook.
-    Only meaningful when target is all-zero (negative sample).
-    """
+    """False Positive Rate on negative (polyp-free) samples."""
     p, t = _to_binary_np(pred, target, threshold)
+    # If target has polyp, this is not a negative sample
     if t.sum() > 0:
-        return None   # not a negative sample
-    fp  = p.sum()
+        return None  
+        
+    fp    = p.sum()
     total = p.size
     return float(fp) / (total + 1e-8)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Full metrics dict  (compute all 9 at once)
+#  Full metrics dict
 # ══════════════════════════════════════════════════════════════════════════════
 
 def compute_all_metrics(pred, target, threshold=0.5):
-    """
-    Compute all metrics for a single prediction.
-    pred / target can be tensors or numpy arrays.
-    Returns a dict with all 9 metric values.
-    """
+    """Compute all 9 metrics for a single image."""
     metrics = {
         "dice":        dice_score(pred,        target, threshold),
         "iou":         iou_score(pred,         target, threshold),
@@ -170,24 +154,16 @@ def compute_all_metrics(pred, target, threshold=0.5):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  MetricsTracker  —  epoch-level aggregation
+#  MetricsTracker
 # ══════════════════════════════════════════════════════════════════════════════
 
 class MetricsTracker:
-    """
-    Tracks all metrics over an epoch using AverageMeter.
-    Usage:
-        tracker = MetricsTracker()
-        for batch in loader:
-            m = compute_all_metrics(pred, gt)
-            tracker.update(m, n=batch_size)
-        results = tracker.get_averages()
-    """
+    """Tracks metrics over an epoch."""
     METRIC_NAMES = ["dice", "iou", "precision", "recall", "specificity", "f1", "hd95"]
 
     def __init__(self):
         self.meters = {k: AverageMeter() for k in self.METRIC_NAMES}
-        self.fpr_values = []   # FPR only for negative samples
+        self.fpr_values = []
 
     def reset(self):
         for m in self.meters.values():
@@ -198,6 +174,7 @@ class MetricsTracker:
         for key in self.METRIC_NAMES:
             if key in metrics_dict and metrics_dict[key] is not None:
                 self.meters[key].update(metrics_dict[key], n)
+        
         if metrics_dict.get("fpr") is not None:
             self.fpr_values.append(metrics_dict["fpr"])
 
@@ -207,31 +184,14 @@ class MetricsTracker:
             result["fpr_negatives"] = float(np.mean(self.fpr_values))
         return result
 
-    def print_summary(self, prefix=""):
-        avgs = self.get_averages()
-        print(f"{prefix}Dice={avgs['dice']:.4f} | IoU={avgs['iou']:.4f} | "
-              f"Prec={avgs['precision']:.4f} | Recall={avgs['recall']:.4f} | "
-              f"Spec={avgs['specificity']:.4f} | F1={avgs['f1']:.4f} | "
-              f"HD95={avgs['hd95']:.2f}")
-        if "fpr_negatives" in avgs:
-            print(f"{prefix}FPR (negatives)={avgs['fpr_negatives']:.4f}")
-
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Size-stratified evaluation (your novel contribution from Code 4 EDA)
+#  Size-stratified evaluation
 # ══════════════════════════════════════════════════════════════════════════════
 
 def compute_size_stratified_metrics(predictions, targets, threshold=0.5):
     """
     Compute Dice score stratified by polyp coverage size.
-    Based on Code 4's EDA coverage bins.
-
-    Args:
-        predictions : list of pred tensors/arrays
-        targets     : list of GT tensors/arrays
-
-    Returns:
-        dict with Dice for each size category
     """
     bins = {
         "empty":  [],   # coverage == 0
@@ -241,25 +201,31 @@ def compute_size_stratified_metrics(predictions, targets, threshold=0.5):
         "huge":   [],   # coverage > 0.30
     }
 
-    for pred, target in zip(predictions, targets):
+    # If inputs are tensors, convert to list of numpy arrays
+    if torch.is_tensor(predictions):
+        predictions = predictions.cpu().detach()
+    if torch.is_tensor(targets):
+        targets = targets.cpu().detach()
+
+    for i in range(len(predictions)):
+        pred = predictions[i]
+        target = targets[i]
+        
         if torch.is_tensor(target):
             t_np = target.cpu().numpy()
         else:
             t_np = np.array(target)
+            
         coverage = (t_np > 0.5).sum() / t_np.size
 
-        if coverage == 0:
-            cat = "empty"
-        elif coverage <= 0.05:
-            cat = "small"
-        elif coverage <= 0.15:
-            cat = "medium"
-        elif coverage <= 0.30:
-            cat = "large"
-        else:
-            cat = "huge"
+        if coverage == 0:        cat = "empty"
+        elif coverage <= 0.05:   cat = "small"
+        elif coverage <= 0.15:   cat = "medium"
+        elif coverage <= 0.30:   cat = "large"
+        else:                    cat = "huge"
 
-        bins[cat].append(dice_score(pred, target, threshold))
+        score = dice_score(pred, target, threshold)
+        bins[cat].append(score)
 
     results = {}
     for cat, scores in bins.items():
@@ -271,13 +237,13 @@ def compute_size_stratified_metrics(predictions, targets, threshold=0.5):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Inference timer
+#  Inference Timer
 # ══════════════════════════════════════════════════════════════════════════════
 
 class InferenceTimer:
-    """Measures average inference time per image (from Code 1, Cell 17)."""
     def __init__(self):
         self.times = []
+        self._t = 0
 
     def start(self):
         self._t = time.time()
@@ -287,7 +253,3 @@ class InferenceTimer:
 
     def mean_ms(self):
         return float(np.mean(self.times)) * 1000 if self.times else 0.0
-
-    def summary(self):
-        return (f"Avg inference: {self.mean_ms():.2f} ms/img "
-                f"({len(self.times)} images)")
